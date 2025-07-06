@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
 from ultralytics import YOLO, __version__
-from ultralytics.nn.modules import Detect, C2f, Conv, Bottleneck
+from ultralytics.nn.modules import Detect, C3k2, Conv, Bottleneck
 
 from ultralytics.nn.tasks import attempt_load_one_weight
 from ultralytics.engine.model import Model
@@ -95,64 +95,58 @@ def save_pruning_performance_graph(x, y1, y2, y3):
 
     plt.title('Comparison of mAP and MACs with Pruning Ratio')
     plt.savefig('pruning_perf_change.png')
-# ---------------------- C3k (original) ----------------------
-class C3k(nn.Module):
-    """
-    CSP bottleneck with custom kernel size (k) support.
-    """
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1)
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
 
-    def forward(self, x):
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
-# ---------------------- C3k2 (original) ----------------------
-class C3k2(nn.Module):
-    """
-    CSP bottleneck with optional C3k blocks.
-    """
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
-        super().__init__()
-        self.c = int(c2 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv((2 + n) * self.c, c2, 1)
-        self.m = nn.ModuleList(
-            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g)
-            for _ in range(n)
-        )
+# ---------------------- C3k (v2) ----------------------
+# class C3k_v2(nn.Module):
+#     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=3):
+#         super().__init__()
+#         self.c = int(c2 * e) # hidden channels
+#         self.cv0 = Conv(c1, self.c, 1, 1) # learnable identity/residual path
+#         self.cv1 = Conv(c1, self.c, 1, 1)  # bottleneck input transform
+#         self.m = nn.ModuleList([
+#             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
+#             for _ in range(n) ])
+#         self.cv2 = Conv((1 + n) * self.c, c2, 1, 1)  # final projection
+#     def forward(self, x):
+#         y = [self.cv0(x)]  # learnable residual/identity path
+#         x1 = self.cv1(x)
+#         y.extend(m(x1) for m in self.m)  # parallel bottlenecks
+#         return self.cv2(torch.cat(y, dim=1))
 
-    def forward(self, x):
-        y = list(self.cv1(x).chunk(2, dim=1))
-        y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(torch.cat(y, dim=1))
 # ---------------------- C3k2_v2 (fast version) ----------------------
 class C3k2_v2(nn.Module):
     """
     Faster variant of C3k2 using two input convs instead of chunk.
     """
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
         super().__init__()
         self.c = int(c2 * e)
-        self.cv0 = Conv(c1, self.c, 1, 1)
-        self.cv1 = Conv(c1, self.c, 1, 1)
-        self.cv2 = Conv((2 + n) * self.c, c2, 1)
-        self.m = nn.ModuleList(
-            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g)
-            for _ in range(n)
-        )
+        self.cv0 = Conv(c1, self.c, 1, 1)  # learnable shortcut path
+        self.cv1 = Conv(c1, self.c, 1, 1)  # main feature path
+        self.cv2 = Conv((1 + 2 * n) * self.c, c2, 1)
+        self.m = nn.ModuleList([Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(2* n)])
 
     def forward(self, x):
-        y = [self.cv0(x), self.cv1(x)]
-        y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(torch.cat(y, dim=1))
-def infer_shortcut(bottleneck):
-    c1 = bottleneck.cv1.conv.in_channels
-    c2 = bottleneck.cv2.conv.out_channels
-    return c1 == c2 and hasattr(bottleneck, 'add') and bottleneck.add
+        y0 = self.cv0(x)
+        y1 = self.cv1(x)
+        outputs = [y0, y1]
+
+        for m in self.m:
+            y1 = m(y1)
+            outputs.append(y1)
+
+        return self.cv2(torch.cat(outputs, dim=1))
+
+def infer_shortcut(block):
+    """
+    Determines if shortcut is used in a C3k2_v2 block
+    based on input and output channel match.
+    """
+    if isinstance(block, C3k2_v2):
+        c1 = block.cv1.conv.in_channels
+        c2 = block.cv2.conv.out_channels
+        return c1 == c2
+    return False
 
 def transfer_weights_c3k2(c3k2, c3k2_v2):
     c3k2_v2.cv2 = c3k2.cv2
@@ -161,20 +155,24 @@ def transfer_weights_c3k2(c3k2, c3k2_v2):
     state_dict = c3k2.state_dict()
     state_dict_v2 = c3k2_v2.state_dict()
 
+    # Transfer cv1 weights from C2f to cv0 and cv1 in C2f_v2
     old_weight = state_dict['cv1.conv.weight']
     half_channels = old_weight.shape[0] // 2
     state_dict_v2['cv0.conv.weight'] = old_weight[:half_channels]
     state_dict_v2['cv1.conv.weight'] = old_weight[half_channels:]
 
+    # Transfer cv1 batchnorm weights and buffers from C2f to cv0 and cv1 in C2f_v2
     for bn_key in ['weight', 'bias', 'running_mean', 'running_var']:
         old_bn = state_dict[f'cv1.bn.{bn_key}']
         state_dict_v2[f'cv0.bn.{bn_key}'] = old_bn[:half_channels]
         state_dict_v2[f'cv1.bn.{bn_key}'] = old_bn[half_channels:]
 
+    # Transfer remaining weights and buffers
     for key in state_dict:
         if not key.startswith('cv1.'):
             state_dict_v2[key] = state_dict[key]
 
+    # Transfer all non-method attributes
     for attr_name in dir(c3k2):
         attr_value = getattr(c3k2, attr_name)
         if not callable(attr_value) and '_' not in attr_name:
@@ -186,15 +184,13 @@ def replace_c3k2_with_c3k2_v2(module):
     for name, child in module.named_children():
         if isinstance(child, C3k2):
             shortcut = infer_shortcut(child.m[0])
-            c3k = isinstance(child.m[0], C3k)
             c3k2_v2 = C3k2_v2(
                 c1=child.cv1.conv.in_channels,
                 c2=child.cv2.conv.out_channels,
                 n=len(child.m),
-                c3k=c3k,
-                e=child.c / child.cv2.conv.out_channels,
+                shortcut=shortcut,
                 g=child.m[0].cv2.conv.groups,
-                shortcut=shortcut
+                e=child.c / child.cv2.conv.out_channels
             )
             transfer_weights_c3k2(child, c3k2_v2)
             setattr(module, name, c3k2_v2)
@@ -309,12 +305,8 @@ def train_v2(self: YOLO, pruning=False, **kwargs):
         self.metrics = getattr(self.trainer.validator, 'metrics', None)
 
 def prune(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
     # Load the model yolov11n
     model = YOLO(args.model)
-    model.model.to(device)
 
     # Replace the default training method with a custom one that supports pruning
     model.__setattr__("train_v2", train_v2.__get__(model))
@@ -326,23 +318,22 @@ def prune(args):
     # use coco128 dataset for 10 epochs fine-tuning each pruning iteration step
     # this part is only for sample code, number of epochs should be included in config file
     pruning_cfg['data'] = "coco128.yaml"
-    pruning_cfg['epochs'] = 10
+    pruning_cfg['epochs'] = 2
 
     model.model.train()  # Set to training mode
     replace_c3k2_with_c3k2_v2(model.model)  # Critical step!
-    initialize_weights(model.model)  # Reset batch norm statistics
+    # initialize_weights(model.model)  # Reset batch norm statistics
 
     for name, param in model.model.named_parameters():
         param.requires_grad = True
 
-    example_inputs = torch.randn(1, 3, pruning_cfg["imgsz"], pruning_cfg["imgsz"]).to(device)
+    example_inputs = torch.randn(1, 3, pruning_cfg["imgsz"], pruning_cfg["imgsz"]).to(model.device)
     macs_list, nparams_list, map_list, pruned_map_list = [], [], [], []
     base_macs, base_nparams = tp.utils.count_ops_and_params(model.model, example_inputs)
 
     # do validation before pruning model
     pruning_cfg['name'] = f"baseline_val"
     pruning_cfg['batch'] = 1
-    pruning_cfg['device'] = device.type
     validation_model = deepcopy(model)
     metric = validation_model.val(**pruning_cfg)
     init_map = metric.box.map
@@ -352,12 +343,13 @@ def prune(args):
     pruned_map_list.append(init_map)
     print(f"Before Pruning: MACs={base_macs / 1e9: .5f} G, #Params={base_nparams / 1e6: .5f} M, mAP={init_map: .5f}")
 
+    
+
     pruning_ratio = 1 - math.pow((1 - args.target_prune_rate), 1 / args.iterative_steps)
 
     for i in range(args.iterative_steps):
 
         model.model.train()
-        model.model.to(device)
         for name, param in model.model.named_parameters():
             param.requires_grad = True
 
@@ -367,16 +359,19 @@ def prune(args):
             if isinstance(m, (Detect,)):
                 ignored_layers.append(m)
 
-        example_inputs = example_inputs.to(device)
-        pruner = tp.pruner.GroupNormPruner(
-            model.model,
-            example_inputs,
-            importance=tp.importance.GroupMagnitudeImportance(),  # L2 norm pruning,
-            iterative_steps=1,
-            pruning_ratio=pruning_ratio,
-            ignored_layers=ignored_layers,
-            unwrapped_parameters=unwrapped_parameters
-        )
+        example_inputs = example_inputs.to(model.device)
+        try:
+            pruner = tp.pruner.GroupNormPruner(
+                model.model,
+                example_inputs,
+                importance=tp.importance.GroupMagnitudeImportance(),
+                iterative_steps=1,
+                pruning_ratio=pruning_ratio,
+                ignored_layers=ignored_layers,
+                unwrapped_parameters=unwrapped_parameters
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to initialize pruner: {e}")
 
         # Test regularization
         #output = model.model(example_inputs)
@@ -427,6 +422,7 @@ def prune(args):
     model.export(format='onnx')            
 
 
+from torch.fx import symbolic_trace
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
