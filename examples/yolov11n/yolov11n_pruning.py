@@ -22,7 +22,6 @@ from ultralytics.utils.torch_utils import initialize_weights, de_parallel
 
 import torch_pruning as tp
 
-
 def save_pruning_performance_graph(x, y1, y2, y3):
     """
     Draw performance change graph
@@ -127,26 +126,24 @@ class C3k2_v2(nn.Module):
         self.m = nn.ModuleList([Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(2* n)])
 
     def forward(self, x):
-        y0 = self.cv0(x)
-        y1 = self.cv1(x)
-        outputs = [y0, y1]
+        y = [self.cv0(x), self.cv1(x)]
+        y.extend(m(y[-1]) for m in self.m)  # Static iteration over ModuleList
+        return self.cv2(torch.cat(y, 1))
 
-        for m in self.m:
-            y1 = m(y1)
-            outputs.append(y1)
+    # def forward(self, x):
+    #     y0 = self.cv0(x)
+    #     y1 = self.cv1(x)
+    #     outputs = [y0, y1]
+    #     for m in self.m:
+    #         y1 = m(y1)
+    #         outputs.append(y1)
+    #     return self.cv2(torch.cat(tuple(outputs), dim=1))
 
-        return self.cv2(torch.cat(outputs, dim=1))
 
-def infer_shortcut(block):
-    """
-    Determines if shortcut is used in a C3k2_v2 block
-    based on input and output channel match.
-    """
-    if isinstance(block, C3k2_v2):
-        c1 = block.cv1.conv.in_channels
-        c2 = block.cv2.conv.out_channels
-        return c1 == c2
-    return False
+def infer_shortcut(bottleneck):
+    c1 = bottleneck.cv1.conv.in_channels
+    c2 = bottleneck.cv2.conv.out_channels
+    return c1 == c2 and hasattr(bottleneck, 'add') and bottleneck.add
 
 def transfer_weights_c3k2(c3k2, c3k2_v2):
     c3k2_v2.cv2 = c3k2.cv2
@@ -322,7 +319,7 @@ def prune(args):
 
     model.model.train()  # Set to training mode
     replace_c3k2_with_c3k2_v2(model.model)  # Critical step!
-    # initialize_weights(model.model)  # Reset batch norm statistics
+    initialize_weights(model.model)  # Reset batch norm statistics
 
     for name, param in model.model.named_parameters():
         param.requires_grad = True
@@ -346,7 +343,8 @@ def prune(args):
     
 
     pruning_ratio = 1 - math.pow((1 - args.target_prune_rate), 1 / args.iterative_steps)
-
+    
+    
     for i in range(args.iterative_steps):
 
         model.model.train()
@@ -358,27 +356,111 @@ def prune(args):
         for m in model.model.modules():
             if isinstance(m, (Detect,)):
                 ignored_layers.append(m)
-
+  
+        print("[DEBUG] About to initialize pruner...")
         example_inputs = example_inputs.to(model.device)
+        
+        print("[DEBUG] Starting dependency graph building...")
+        import time
+        start_time = time.time()
+        
+        # Test if model forward pass works
+        print("[DEBUG] Testing model forward pass...")
+        with torch.no_grad():
+            test_output = model.model(example_inputs)
+        print(f"[DEBUG] Model forward pass successful, output type: {type(test_output)}")
+        
+        print("[DEBUG] Building dependency graph...")
+        DG = tp.DependencyGraph()
+        DG.build_dependency(model.model, example_inputs, verbose=True)
+        print("[DEBUG] Dependency graph built successfully")
+
+        print("[DEBUG] checking FX Tracing ")
+        import torch.fx as fx
         try:
-            pruner = tp.pruner.GroupNormPruner(
-                model.model,
-                example_inputs,
-                importance=tp.importance.GroupMagnitudeImportance(),
-                iterative_steps=1,
-                pruning_ratio=pruning_ratio,
-                ignored_layers=ignored_layers,
-                unwrapped_parameters=unwrapped_parameters
-            )
+            traced = fx.symbolic_trace(model)
+            print("[OK] Full model FX tracing succeeded.")
         except Exception as e:
-            print(f"⚠️ Failed to initialize pruner: {e}")
+            print(f"[FAIL] Full model FX tracing failed: {type(e).__name__} - {e}")
+
+        try:
+            traced = fx.symbolic_trace(model.model)
+            print("[OK] FX tracing on model.model succeeded")
+            print(traced.graph)
+        except Exception as e:
+            print(f"[FAIL] FX tracing on model.model failed: {type(e).__name__} - {e}")
+
+        print("[DEBUG] Running FX tracing block-by-block...")
+        for i, (name, m) in enumerate(model.model.named_children()):
+            try:
+                print(f"[FX TEST] Tracing model.model[{i}] ({name}: {type(m).__name__})...")
+                fx.symbolic_trace(m)
+                print(f"[OK] model.model[{i}] FX trace success\n")
+            except Exception as e:
+                print(f"[FAIL] model.model[{i}] FX trace failed: {type(e).__name__} - {e}\n")
+                break  
+
+        for name, module in model.model.named_modules():
+            if isinstance(module, C3k2_v2):
+                print(f"Tracing {name} ({module})")
+                try:
+                    fx.symbolic_trace(module)
+                    print(f"[OK] Traced {name}")
+                except Exception as e:
+                    print(f"[FAIL] Tracing {name} failed: {e}")    
+
+
+        # print(model.model)
+
+        # Initialize pruner with verbose logging
+        print("[DEBUG] Initializing GroupNormPruner...")
+
+        # from ultralytics.nn.tasks import DetectionModel
+
+        # def bypass_forward(self, x, *args, **kwargs):
+        #     """Bypass problematic forward logic for FX tracing"""
+        #     if isinstance(x, dict):
+        #         return self.loss(x, *args, **kwargs)
+        #     # Use the correct method signature
+        #     return self.predict(x, profile=False, visualize=False, embed=None)
+
+        # DetectionModel.forward = bypass_forward
+        # print("[DEBUG] Model structure:")
+        # for name, module in model.model.named_modules():
+        #     print(f"{name}: {type(module)}")
+
+        pruner = tp.pruner.GroupNormPruner(
+            model.model,
+            example_inputs,
+            importance=tp.importance.GroupMagnitudeImportance(),
+            iterative_steps=1,
+            pruning_ratio=pruning_ratio,
+            ignored_layers=ignored_layers,
+            unwrapped_parameters=unwrapped_parameters,
+            # forward_fn= bypass_forward
+        )
+
+        # pruner = tp.pruner.MagnitudePruner(
+        #     model.model,
+        #     example_inputs,
+        #     importance=tp.importance.MagnitudeImportance(),
+        #     iterative_steps=1,
+        #     pruning_ratio=pruning_ratio,
+        #     ignored_layers=ignored_layers,
+        #     unwrapped_parameters=unwrapped_parameters,
+        # )
+            
+        print("[DEBUG] GroupNormPruner initialized successfully")    
+
+        
 
         # Test regularization
         #output = model.model(example_inputs)
         #(output[0].sum() + sum([o.sum() for o in output[1]])).backward()
         #pruner.regularize(model.model)
-        
+        print("[DEBUG] Before pruner.step()")
         pruner.step()
+        print("[DEBUG] After pruner.step()")
         # pre fine-tuning validation
         pruning_cfg['name'] = f"step_{i}_pre_val"
         pruning_cfg['batch'] = 1
@@ -421,16 +503,13 @@ def prune(args):
 
     model.export(format='onnx')            
 
-
-from torch.fx import symbolic_trace
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='yolo11n.pt', help='Pretrained pruning target model file')
     parser.add_argument('--cfg', default='default.yaml',
                         help='Pruning config file.'
                              ' This file should have same format with ultralytics/yolo/cfg/default.yaml')
-    parser.add_argument('--iterative-steps', default=16, type=int, help='Total pruning iteration step')
+    parser.add_argument('--iterative-steps', default=1, type=int, help='Total pruning iteration step')
     parser.add_argument('--target-prune-rate', default=0.5, type=float, help='Target pruning rate')
     parser.add_argument('--max-map-drop', default=0.2, type=float, help='Allowed maximum map drop after fine-tuning')
 
