@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
 from ultralytics import YOLO, __version__
-from ultralytics.nn.modules import Detect, C3k2, Conv, Bottleneck
+from ultralytics.nn.modules import Detect, C3k2, Conv, Bottleneck, C2PSA, C2f
 
 from ultralytics.nn.tasks import attempt_load_one_weight
 from ultralytics.engine.model import Model
@@ -95,62 +95,66 @@ def save_pruning_performance_graph(x, y1, y2, y3):
     plt.title('Comparison of mAP and MACs with Pruning Ratio')
     plt.savefig('pruning_perf_change.png')
 
-# ---------------------- C3k (v2) ----------------------
-# class C3k_v2(nn.Module):
-#     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=3):
-#         super().__init__()
-#         self.c = int(c2 * e) # hidden channels
-#         self.cv0 = Conv(c1, self.c, 1, 1) # learnable identity/residual path
-#         self.cv1 = Conv(c1, self.c, 1, 1)  # bottleneck input transform
-#         self.m = nn.ModuleList([
-#             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
-#             for _ in range(n) ])
-#         self.cv2 = Conv((1 + n) * self.c, c2, 1, 1)  # final projection
-#     def forward(self, x):
-#         y = [self.cv0(x)]  # learnable residual/identity path
-#         x1 = self.cv1(x)
-#         y.extend(m(x1) for m in self.m)  # parallel bottlenecks
-#         return self.cv2(torch.cat(y, dim=1))
-
-# ---------------------- C3k2_v2 (fast version) ----------------------
-class C3k2_v2(nn.Module):
-    """
-    Faster variant of C3k2 using two input convs instead of chunk.
-    """
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
-        super().__init__()
-        self.c = int(c2 * e)
-        self.cv0 = Conv(c1, self.c, 1, 1)  # learnable shortcut path
-        self.cv1 = Conv(c1, self.c, 1, 1)  # main feature path
-        self.cv2 = Conv((1 + 2 * n) * self.c, c2, 1)
-        self.m = nn.ModuleList([Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(2* n)])
-
-    def forward(self, x):
-        y = [self.cv0(x), self.cv1(x)]
-        y.extend(m(y[-1]) for m in self.m)  # Static iteration over ModuleList
-        return self.cv2(torch.cat(y, 1))
-
-    # def forward(self, x):
-    #     y0 = self.cv0(x)
-    #     y1 = self.cv1(x)
-    #     outputs = [y0, y1]
-    #     for m in self.m:
-    #         y1 = m(y1)
-    #         outputs.append(y1)
-    #     return self.cv2(torch.cat(tuple(outputs), dim=1))
-
 
 def infer_shortcut(bottleneck):
     c1 = bottleneck.cv1.conv.in_channels
     c2 = bottleneck.cv2.conv.out_channels
     return c1 == c2 and hasattr(bottleneck, 'add') and bottleneck.add
 
-def transfer_weights_c3k2(c3k2, c3k2_v2):
-    c3k2_v2.cv2 = c3k2.cv2
-    c3k2_v2.m = c3k2.m
+# # ---------------------- C3k2_v2 (Simple) ----------------------
+class c3k2_v2_simple(nn.Module):
+    # CSP Bottleneck with 2 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv0 = Conv(c1, self.c, 1, 1)
+        self.cv1 = Conv(c1, self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
 
-    state_dict = c3k2.state_dict()
-    state_dict_v2 = c3k2_v2.state_dict()
+    def forward(self, x):
+        # y = list(self.cv1(x).chunk(2, 1))
+        y = [self.cv0(x), self.cv1(x)]
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+# ---------------------- C3k_v2 (-------) ----------------------
+class c3k_v2(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e) 
+        # self.cv0 = Conv(c1, self.c, 1, 1) 
+        self.cv1 = Conv(c1, self.c, 1, 1) 
+        self.cv2 = Conv(c1, self.c, 1, 1) 
+        self.cv3 = Conv((1+n) * self.c, c2, 1, 1)  # final projection
+        self.m = nn.Sequential(*[Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(2*n)])
+    
+    def forward(self, x):
+        y = [self.cv1(x)]
+        y.append(self.m(self.cv2(x)))
+        return self.cv3(torch.cat(y, 1))
+
+# ---------------------- C3k2_v2(Complex) ----------------------
+class c3k2_v2_complex(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv0 = Conv(c1, c2, 1, 1)  # learnable shortcut path
+        self.cv1 = Conv(c1, c2, 1, 1)  # main feature path
+        self.cv2 = Conv((2 + n) * self.c, c2, 1, 1)
+        self.m = nn.ModuleList([C3k_v2(self.c, self.c, n=2, shortcut=shortcut, g=g, e=e) for _ in range(n)])
+    def forward(self, x):
+        y = [self.cv0(x), self.cv1(x)]
+        y.extend(m(y[-1]) for m in self.m)  # Static iteration over ModuleList
+        return self.cv2(torch.cat(y, 1))
+
+
+def transfer_weights_c3k2(c2f, c2f_v2):
+    c2f_v2.cv2 = c2f.cv2
+    c2f_v2.m = c2f.m
+
+    state_dict = c2f.state_dict()
+    state_dict_v2 = c2f_v2.state_dict()
 
     # Transfer cv1 weights from C2f to cv0 and cv1 in C2f_v2
     old_weight = state_dict['cv1.conv.weight']
@@ -170,29 +174,43 @@ def transfer_weights_c3k2(c3k2, c3k2_v2):
             state_dict_v2[key] = state_dict[key]
 
     # Transfer all non-method attributes
-    for attr_name in dir(c3k2):
-        attr_value = getattr(c3k2, attr_name)
+    for attr_name in dir(c2f):
+        attr_value = getattr(c2f, attr_name)
         if not callable(attr_value) and '_' not in attr_name:
-            setattr(c3k2_v2, attr_name, attr_value)
+            setattr(c2f_v2, attr_name, attr_value)
 
-    c3k2_v2.load_state_dict(state_dict_v2)
+    c2f_v2.load_state_dict(state_dict_v2)
 
 def replace_c3k2_with_c3k2_v2(module):
-    for name, child in module.named_children():
-        if isinstance(child, C3k2):
-            shortcut = infer_shortcut(child.m[0])
-            c3k2_v2 = C3k2_v2(
-                c1=child.cv1.conv.in_channels,
-                c2=child.cv2.conv.out_channels,
-                n=len(child.m),
-                shortcut=shortcut,
-                g=child.m[0].cv2.conv.groups,
-                e=child.c / child.cv2.conv.out_channels
-            )
-            transfer_weights_c3k2(child, c3k2_v2)
-            setattr(module, name, c3k2_v2)
+    """
+    Replace C3k2 blocks with appropriate C3k2_v2 variants based on internal structure
+    """
+    for name, child_module in module.named_children():
+        if isinstance(child_module, C3k2):
+            shortcut = infer_shortcut(child_module.m[0])
+            # Determine if it's simple or complex based on internal structure
+            has_c3k_subblock= any('C3k' in str(type(m).__name__) for m in module.m) if hasattr(module, 'm') else False
+
+            if has_c3k_subblock:
+                # Complex C3k2 block with C3k sub-blocks
+                print(f"Replacing complex C3k2 block: {name}")
+                c3k2_v2 = c3k2_v2_complex(child_module.cv1.conv.in_channels, child_module.cv2.conv.out_channels,
+                            n=len(child_module.m), shortcut=shortcut,
+                            g=child_module.m[0].cv2.conv.groups,
+                            e=child_module.c / child_module.cv2.conv.out_channels)
+                transfer_weights_c3k2(child_module, c3k2_v2)
+                setattr(module, name, c3k2_v2)
+            else:
+                c3k2_v2 = c3k2_v2_simple(child_module.cv1.conv.in_channels, child_module.cv2.conv.out_channels,
+                            n=len(child_module.m), shortcut=shortcut,
+                            g=child_module.m[0].cv2.conv.groups,
+                            e=child_module.c / child_module.cv2.conv.out_channels)
+                transfer_weights_c3k2(child_module, c3k2_v2)
+                setattr(module, name, c3k2_v2)
+            
         else:
-            replace_c3k2_with_c3k2_v2(child)
+            # Recursively process child modules
+            replace_c3k2_with_c3k2_v2(child_module)
 
 def save_model_v2(self: BaseTrainer):
     """
@@ -234,7 +252,7 @@ def strip_optimizer_v2(f: Union[str, Path] = 'best.pt', s: str = '') -> None:
     """
     Disabled half precision saving. originated from ultralytics/yolo/utils/torch_utils.py
     """
-    x = torch.load(f, map_location=torch.device('cpu'))
+    x = torch.load(f,weights_only=False)
     args = {**DEFAULT_CFG_DICT, **x['train_args']}  # combine model args with default args, preferring model args
     if x.get('ema'):
         x['model'] = x['ema']  # replace model with ema
@@ -315,7 +333,9 @@ def prune(args):
     # use coco128 dataset for 10 epochs fine-tuning each pruning iteration step
     # this part is only for sample code, number of epochs should be included in config file
     pruning_cfg['data'] = "coco128.yaml"
-    pruning_cfg['epochs'] = 2
+    pruning_cfg['epochs'] = 15
+    pruning_cfg['lr0'] = 0.001  # Lower initial learning rate
+    pruning_cfg['warmup_epochs'] = 3  # Add warmup
 
     model.model.train()  # Set to training mode
     replace_c3k2_with_c3k2_v2(model.model)  # Critical step!
@@ -338,6 +358,7 @@ def prune(args):
     nparams_list.append(100)
     map_list.append(init_map)
     pruned_map_list.append(init_map)
+    print(pruned_map_list)
     print(f"Before Pruning: MACs={base_macs / 1e9: .5f} G, #Params={base_nparams / 1e6: .5f} M, mAP={init_map: .5f}")
 
     
@@ -356,63 +377,11 @@ def prune(args):
         for m in model.model.modules():
             if isinstance(m, (Detect,)):
                 ignored_layers.append(m)
+            elif isinstance(m, C2PSA):  # YOLOv11's spatial attention blocks
+                # You may want to be more conservative with C2PSA blocks
+                ignored_layers.append(m)    
   
-        print("[DEBUG] About to initialize pruner...")
-        example_inputs = example_inputs.to(model.device)
-        
-        print("[DEBUG] Starting dependency graph building...")
-        import time
-        start_time = time.time()
-        
-        # Test if model forward pass works
-        print("[DEBUG] Testing model forward pass...")
-        with torch.no_grad():
-            test_output = model.model(example_inputs)
-        print(f"[DEBUG] Model forward pass successful, output type: {type(test_output)}")
-        
-        print("[DEBUG] Building dependency graph...")
-        DG = tp.DependencyGraph()
-        DG.build_dependency(model.model, example_inputs, verbose=True)
-        print("[DEBUG] Dependency graph built successfully")
 
-        print("[DEBUG] checking FX Tracing ")
-        import torch.fx as fx
-        try:
-            traced = fx.symbolic_trace(model)
-            print("[OK] Full model FX tracing succeeded.")
-        except Exception as e:
-            print(f"[FAIL] Full model FX tracing failed: {type(e).__name__} - {e}")
-
-        try:
-            traced = fx.symbolic_trace(model.model)
-            print("[OK] FX tracing on model.model succeeded")
-            print(traced.graph)
-        except Exception as e:
-            print(f"[FAIL] FX tracing on model.model failed: {type(e).__name__} - {e}")
-
-        print("[DEBUG] Running FX tracing block-by-block...")
-        for i, (name, m) in enumerate(model.model.named_children()):
-            try:
-                print(f"[FX TEST] Tracing model.model[{i}] ({name}: {type(m).__name__})...")
-                fx.symbolic_trace(m)
-                print(f"[OK] model.model[{i}] FX trace success\n")
-            except Exception as e:
-                print(f"[FAIL] model.model[{i}] FX trace failed: {type(e).__name__} - {e}\n")
-                break  
-
-        for name, module in model.model.named_modules():
-            if isinstance(module, C3k2_v2):
-                print(f"Tracing {name} ({module})")
-                try:
-                    fx.symbolic_trace(module)
-                    print(f"[OK] Traced {name}")
-                except Exception as e:
-                    print(f"[FAIL] Tracing {name} failed: {e}")    
-
-
-        # print(model.model)
-
-        # Initialize pruner with verbose logging
         print("[DEBUG] Initializing GroupNormPruner...")
 
         # from ultralytics.nn.tasks import DetectionModel
@@ -433,7 +402,7 @@ def prune(args):
             model.model,
             example_inputs,
             importance=tp.importance.GroupMagnitudeImportance(),
-            iterative_steps=1,
+            iterative_steps=5,
             pruning_ratio=pruning_ratio,
             ignored_layers=ignored_layers,
             unwrapped_parameters=unwrapped_parameters,
@@ -461,6 +430,46 @@ def prune(args):
         print("[DEBUG] Before pruner.step()")
         pruner.step()
         print("[DEBUG] After pruner.step()")
+
+        # COMPREHENSIVE DEVICE SYNCHRONIZATION
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        print(f"[DEBUG] Target device: {device}")
+
+        # Move model and all components
+        model.model = model.model.to(device)
+
+        # Ensure all modules and their attributes are on the correct device
+        def move_module_to_device(module, target_device):
+            module.to(target_device)
+            for attr_name in dir(module):
+                if not attr_name.startswith('_') and not callable(getattr(module, attr_name)):
+                    attr_value = getattr(module, attr_name)
+                    if isinstance(attr_value, torch.Tensor):
+                        setattr(module, attr_name, attr_value.to(target_device))
+
+        for module in model.model.modules():
+            move_module_to_device(module, device)
+
+        # Handle loss function specifically - LOSS-AWARE VERSION
+        if hasattr(model.model, 'criterion') and model.model.criterion is not None:
+            criterion = model.model.criterion
+            if hasattr(criterion, 'to'):
+                # Standard PyTorch module with .to() method
+                move_module_to_device(criterion, device)
+                print("[DEBUG] Moved criterion to device using .to()")
+            else:
+                # Custom loss function - move internal tensors manually
+                print(f"[DEBUG] Criterion type: {type(criterion)}")
+                for attr_name in dir(criterion):
+                    if not attr_name.startswith('_') and not callable(getattr(criterion, attr_name)):
+                        attr_value = getattr(criterion, attr_name)
+                        if isinstance(attr_value, torch.Tensor):
+                            setattr(criterion, attr_name, attr_value.to(device))
+                            print(f"[DEBUG] Moved {attr_name} tensor to device")
+                print("[DEBUG] Moved criterion tensors manually")
+        else:
+            print("[DEBUG] model.model.criterion is None or doesn't exist, skipping")
+
         # pre fine-tuning validation
         pruning_cfg['name'] = f"step_{i}_pre_val"
         pruning_cfg['batch'] = 1
@@ -509,8 +518,8 @@ if __name__ == "__main__":
     parser.add_argument('--cfg', default='default.yaml',
                         help='Pruning config file.'
                              ' This file should have same format with ultralytics/yolo/cfg/default.yaml')
-    parser.add_argument('--iterative-steps', default=1, type=int, help='Total pruning iteration step')
-    parser.add_argument('--target-prune-rate', default=0.5, type=float, help='Target pruning rate')
+    parser.add_argument('--iterative-steps', default=10, type=int, help='Total pruning iteration step')
+    parser.add_argument('--target-prune-rate', default=0.05, type=float, help='Target pruning rate')
     parser.add_argument('--max-map-drop', default=0.2, type=float, help='Allowed maximum map drop after fine-tuning')
 
     args = parser.parse_args()
