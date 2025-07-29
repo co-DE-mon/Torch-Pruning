@@ -1,47 +1,57 @@
 import time
 import numpy as np
+import torch_pruning as tp
+import os
+import tempfile
+import torch
 
-def get_map_metrics(model):
-    """
-    Validate the model and return mAP metrics
-    """
-    print("Validating model...")
-    metrics = model.val()
+def get_mAP_metrics(yolo_model):
+    metrics = yolo_model.val()
+    mAP50 = metrics.box.map50
+    mAP50_95 = metrics.box.map
     
-    # Print metrics
-    print("\n=== Training Results ===")
-    print(f"mAP50-95: {metrics.box.map:.4f}")
-    print(f"mAP50: {metrics.box.map50:.4f}")
-    print(f"mAP75: {metrics.box.map75:.4f}")
+    print(f"mAP@0.5: {mAP50:.4f}")
+    print(f"mAP@0.5:0.95: {mAP50_95:.4f}")
     
-    return metrics
+    return mAP50, mAP50_95
 
-def get_inference_time(model):
+def get_flops_and_params(model,example_inputs):
+    flops, nparams = tp.utils.count_ops_and_params(model, example_inputs)
+    return flops , nparams
+
+def get_latency(model, example_inputs):
+    mean_lat, std_lat = tp.utils.benchmark.measure_latency(model,example_inputs)
+    return mean_lat, std_lat
+
+def get_fps(model, example_inputs):
+    fps= tp.utils.benchmark.measure_fps(model,example_inputs)
+    return fps
+
+def get_model_size(model):
+    """
+    Get the size of a PyTorch model in MB.
+    This function temporarily saves the model's state_dict and returns its size.
+    """
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        torch.save(model.state_dict(), tmp.name)
+        size_mb = os.path.getsize(tmp.name) / (1024 * 1024)
+    os.remove(tmp.name)
+    return round(size_mb, 2)
+
+def get_inference_time(model, example_inputs):
     """
     Test inference speed and return average inference time in milliseconds
     """
-    print("\n=== Inference Speed Test ===")
-    
-    # Create a dummy image for speed test
-    dummy_image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-    
     # Warm up the model
-    print("Warming up model...")
     for _ in range(10):
-        model.predict(dummy_image, verbose=False)
+        model.predict(example_inputs)
     
     # Time inference over multiple runs
-    print("Testing inference speed...")
     inference_times = []
     for _ in range(100):
         start = time.time()
-        model.predict(dummy_image, verbose=False)
+        model.predict(example_inputs)
         inference_times.append((time.time() - start) * 1000)  # Convert to ms
     
-    avg_inference_time = np.mean(inference_times)
-    print(f"Average inference time: {avg_inference_time:.2f} ms")
-    
+    avg_inference_time = np.mean(inference_times)  
     return avg_inference_time
-
-def count_parameters(model):
-    print( sum(p.numel() for p in model.parameters() if p.requires_grad))
