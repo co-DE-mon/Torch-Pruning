@@ -49,11 +49,11 @@ pruner = GroupNormPruner(..., ignored_layers=ignored_layers)  # Hangs here
 
 ---
 
-## 🔬 Root Cause Analysis
+## 🔬 Possible Cause Analysis
 
 ### ⚠️ Pruner Graph Construction Hangs Due To:
 
-#### 1. **Position Encoding Layer Channel Mismatch**
+#### 1. **Position Encoding Layer Channel Mismatch (MAJOR CAUSE in my opinion)**
 ```python
 self.pe = Conv(all_head_dim, dim, 7, 1, 3, g=dim, act=False)
 ```
