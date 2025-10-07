@@ -1,0 +1,20 @@
+# train: ../train/images
+# val: ../valid/images
+# test: ../test/images
+train: C:/Users/PC/Desktop/Project/Torch-Pruning/examples/yolov11n/BCCD/train/images
+val:   C:/Users/PC/Desktop/Project/Torch-Pruning/examples/yolov11n/BCCD/valid/images
+test:  C:/Users/PC/Desktop/Project/Torch-Pruning/examples/yolov11n/BCCD/test/images
+
+nc: 3
+names: ['Platelets', 'RBC', 'WBC']
+
+# Image size
+width: 640   # image width
+height: 480  # image height
+
+roboflow:
+  workspace: joseph-nelson
+  project: bccd
+  version: 3
+  license: MIT
+  url: https://universe.roboflow.com/joseph-nelson/bccd/dataset/3
