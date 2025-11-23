@@ -9,12 +9,12 @@ from datetime import datetime
 
 from ultralytics import YOLO, __version__
 
-from ultralytics.nn.tasks import attempt_load_one_weight
+# from ultralytics.nn.tasks import attempt_load_one_weight
 from ultralytics.engine.trainer import BaseTrainer
 
 from ultralytics.utils import YAML,LOGGER,RANK,DEFAULT_CFG_DICT,DEFAULT_CFG_KEYS
 from ultralytics.utils.checks import check_yaml
-from ultralytics.utils.torch_utils import de_parallel
+from ultralytics.utils.torch_utils import unwrap_model  # replaces deprecated de_parallel
 
 
 def save_model_v2(self: BaseTrainer):
@@ -24,7 +24,7 @@ def save_model_v2(self: BaseTrainer):
     ckpt = {
         'epoch': self.epoch,
         'best_fitness': self.best_fitness,
-        'model': deepcopy(de_parallel(self.model)),
+        'model': deepcopy(unwrap_model(self.model)),  # unwrap DP/DDP/compiled wrappers
         'ema': deepcopy(self.ema.ema),
         'updates': self.ema.updates,
         'optimizer': self.optimizer.state_dict(),
@@ -120,6 +120,8 @@ def train_v2(self: YOLO, pruning=False, **kwargs):
     self.trainer.train()
     # Update model and cfg after training
     if RANK in (-1, 0):
-        self.model, _ = attempt_load_one_weight(str(self.trainer.best))
+        # self.model, _ = attempt_load_one_weight(str(self.trainer.best))
+        loaded= YOLO(str(self.trainer.best))
+        self.model= loaded.model
         self.overrides = self.model.args
         self.metrics = getattr(self.trainer.validator, 'metrics', None)

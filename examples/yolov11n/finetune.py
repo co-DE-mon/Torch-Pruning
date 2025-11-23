@@ -31,14 +31,13 @@ def fine_tune_yolov11n(
         data=args.data,
         epochs=args.epochs,
         batch=args.batch_size,
-        name="fine_tuned_yolo11n",
+        name=f"finetune_b{args.batch_size}",
         project=save_dir,
         exist_ok=True,
-        # You can pass other hyperparameters here, e.g. lr, optimizer args, augment, etc.
     )
 
     # Verify weights file was created
-    weights_path = save_dir / "fine_tuned_yolo11n" / "weights" / "best.pt"
+    weights_path = save_dir / f"finetune_b{args.batch_size}" / "weights" / "best.pt"
     if weights_path.is_file():
         print(f"Successfully created weights file at: {weights_path}")
     else:
