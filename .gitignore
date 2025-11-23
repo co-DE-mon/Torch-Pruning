@@ -31,3 +31,7 @@ pretrained
 data
 
 cache/
+
+# Allow logs from our experiment folder
+!examples/yolov11n/exper_1/
+!examples/yolov11n/exper_1/*.log
